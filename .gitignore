@@ -4,6 +4,7 @@
 
 # Editor settings
 .vscode/
+.idea/
 
 # Serial capture artifacts
 log.txt

@@ -21,6 +21,13 @@
 #define CAM_PROFILE_HIGH      2
 #define CAM_PROFILE_DEFAULT   CAM_PROFILE_BALANCED
 
+// Focus/legibility pre-check (grayscale, runs before the real JPEG capture).
+// Score is a sum-of-squared-pixel-deltas sharpness proxy logged to Serial on
+// every photo; tune this against real hardware (hold a sharp page and a
+// deliberately blurry/far one in front of the camera and read the scores).
+#define CAM_FOCUS_CHECK_FRAMESIZE  FRAMESIZE_QVGA
+#define CAM_FOCUS_SCORE_MIN        400
+
 // OpenAI
 #define OPENAI_HOST   "api.openai.com"
 #define OPENAI_PATH   "/v1/responses"

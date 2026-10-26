@@ -4,7 +4,11 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
+#include "camera.h"
 #include "config.h"
 #include "wifi_manager.h"
 
@@ -213,6 +217,14 @@ String extractOutputText(const String &rawResponse) {
         }
     }
 
+    content.trim();
+    if (content.endsWith("END OF MESSAGE.")) {
+        content = content.substring(0, content.length() - strlen("END OF MESSAGE."));
+    } else if (content.endsWith("END OF MESSAGE")) {
+        content = content.substring(0, content.length() - strlen("END OF MESSAGE"));
+    }
+    content.trim();
+
     return content.length() > 0 ? content : String("Error: no content in response");
 }
 
@@ -376,6 +388,116 @@ String reply(const String &prompt) {
 
 String solveImage(const String &imageBase64) {
     return chat("", imageBase64, false, false);
+}
+
+namespace {
+
+// Runs ask()/reply()/solveImage() on a background task so the main loop keeps
+// servicing the calculator link port (cbl.eventLoopTick()) while the HTTP
+// request/camera capture is in flight. The task is a self-contained unit of
+// work; the only handoff back to the caller's thread is the single result
+// string below, guarded by asyncMutex.
+SemaphoreHandle_t asyncMutex = xSemaphoreCreateMutex();
+bool asyncBusy = false;
+bool asyncDone = false;
+String asyncResultText;
+
+enum class AsyncKind { Ask, Reply, SolveImage };
+
+struct AsyncTaskParams {
+    AsyncKind kind;
+    String prompt;
+};
+
+void asyncTaskEntry(void *paramPtr) {
+    AsyncTaskParams *params = static_cast<AsyncTaskParams *>(paramPtr);
+    String result;
+
+    switch (params->kind) {
+        case AsyncKind::Ask:
+            result = ask(params->prompt);
+            break;
+        case AsyncKind::Reply:
+            result = reply(params->prompt);
+            break;
+        case AsyncKind::SolveImage: {
+            const Camera::FocusCheckResult focus = Camera::checkFocusQuality();
+            if (!focus.passed) {
+                result = "IMAGE UNCLEAR. HOLD STEADY, GET CLOSER, AND RETRY.";
+            } else {
+                const String imageBase64 = Camera::captureBase64();
+                result = imageBase64.length() > 0
+                             ? solveImage(imageBase64)
+                             : String("Error: camera capture failed");
+            }
+            break;
+        }
+    }
+
+    delete params;
+
+    Serial.printf("OpenAI task stack high water mark: %u bytes\n",
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    asyncResultText = result;
+    asyncDone = true;
+    xSemaphoreGive(asyncMutex);
+
+    vTaskDelete(nullptr);
+}
+
+void beginAsyncTask(AsyncKind kind, const String &prompt) {
+    AsyncTaskParams *params = new AsyncTaskParams();
+    params->kind = kind;
+    params->prompt = prompt;
+
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    asyncBusy = true;
+    asyncDone = false;
+    xSemaphoreGive(asyncMutex);
+
+    constexpr uint32_t kTaskStackBytes = 12288;
+    constexpr UBaseType_t kTaskPriority = 1;
+    constexpr BaseType_t kTaskCore = 0;  // Opposite the Arduino loop task (core 1).
+    TaskHandle_t handle = nullptr;
+    xTaskCreatePinnedToCore(asyncTaskEntry, "openai_task", kTaskStackBytes, params,
+                            kTaskPriority, &handle, kTaskCore);
+}
+
+}  // namespace
+
+bool isBusy() {
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    const bool busy = asyncBusy;
+    xSemaphoreGive(asyncMutex);
+    return busy;
+}
+
+bool pollResult(String *outText) {
+    bool ready = false;
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    if (asyncDone) {
+        *outText = asyncResultText;
+        asyncResultText = "";
+        asyncDone = false;
+        asyncBusy = false;
+        ready = true;
+    }
+    xSemaphoreGive(asyncMutex);
+    return ready;
+}
+
+void beginAsk(const String &prompt) {
+    beginAsyncTask(AsyncKind::Ask, prompt);
+}
+
+void beginReply(const String &prompt) {
+    beginAsyncTask(AsyncKind::Reply, prompt);
+}
+
+void beginSolveImage() {
+    beginAsyncTask(AsyncKind::SolveImage, "");
 }
 
 }  // namespace OpenAI

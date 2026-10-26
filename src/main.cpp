@@ -1,713 +1,503 @@
+#pragma once
+
 #include <Arduino.h>
-#include <algorithm>
-#include <CBL2.h>
-#include <TIVar.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #include "camera.h"
 #include "config.h"
-#include "openai_client.h"
-#include "program_data.h"
 #include "wifi_manager.h"
+
+namespace OpenAI {
 
 namespace {
 
-constexpr int kMaxDataLen = 4096;
-constexpr int kHeaderBufferLen = 16;
-constexpr int kMaxResponseLines = 72;
-constexpr int kResponseWindowLines = 5;
-constexpr unsigned long kHeartbeatIntervalMs = 10000;
-constexpr unsigned long kProgramSendDelayMs = 300;
-constexpr uint8_t kTiMachineIdComputer = 0x23;
-constexpr uint8_t kTiVarTypeProgram = 0x05;
-constexpr uint8_t kTiCmdRequestToSend = 0xC9;
-constexpr uint8_t kTiCmdAcknowledge = 0x56;
-constexpr uint8_t kTiCmdSkip = 0x36;
-constexpr uint8_t kTiCmdClearToSend = 0x09;
-constexpr uint8_t kTiCmdData = 0x15;
-constexpr uint8_t kTiCmdEndOfTransmission = 0x92;
-constexpr unsigned long kEotAckTimeoutUs = 5000000UL;  // Calculator may pause while writing flash.
+constexpr uint16_t kMaxOutputTokens = 512;
+constexpr float kRequestTemperature = 0.3f;
+constexpr unsigned long kWifiReconnectDelayMs = 250;
+constexpr unsigned long kTransportRetryDelayMs = 300;
+constexpr unsigned long kWifiReconnectTimeoutMs = 10000;
+constexpr uint16_t kHttpConnectTimeoutMs = 15000;
+constexpr uint32_t kHttpRequestTimeoutMs = 60000;
+constexpr size_t kResponseParseSlack = 4096;
+constexpr size_t kErrorParseSlack = 2048;
+constexpr size_t kResponseIdDocCapacity = 128;
+constexpr char kDefaultVisionPrompt[] = "Read the image and answer.";
 
-enum class PendingTextCommand : uint8_t {
-    None = 0,
-    AskFresh = 4,
-    Reply = 8,
+struct RequestOptions {
+    String userMessage;
+    String imageBase64;
+    String instructions;
+    bool isVision = false;
+    bool includePreviousResponse = false;
+    bool updateConversationState = false;
 };
 
-enum CommandId : long {
-    kCommandConnect = 1,
-    kCommandDisconnect = 2,
-    kCommandConfigure = 3,
-    kCommandAskFresh = 4,
-    kCommandSnapSolve = 5,
-    kCommandScrollDown = 6,
-    kCommandScrollUp = 7,
-    kCommandReply = 8,
-    kCommandShowPreviousResponse = 9,
+struct RequestResult {
+    int httpCode = HTTPC_ERROR_CONNECTION_REFUSED;
+    String rawBody = "";
 };
 
-CBL2 cbl;
-uint8_t header[kHeaderBufferLen];
-uint8_t data[kMaxDataLen];
+String previousResponseId = "";
 
-bool unlocked = false;
-bool unlockArmed = false;
-bool sendProgramFlag = false;
-bool startConfigFlag = false;
-PendingTextCommand pendingTextCommand = PendingTextCommand::None;
-unsigned long lastHeartbeat = 0;
-unsigned long sendProgramAt = 0;
-
-int currentTopLine = 0;
-int totalResponseLines = 0;
-String responseLines[kMaxResponseLines];
-int previousTopLine = 0;
-int previousTotalResponseLines = 0;
-String previousResponseLines[kMaxResponseLines];
-bool previousResponseAvailable = false;
-String previousConversationResponseId = "";
-String queuedResponse = "";
-bool responseReady = false;
-
-const String &blankResponseLine() {
-    static const String line = []() {
-        String value;
-        value.reserve(SCREEN_WIDTH);
-        for (int i = 0; i < SCREEN_WIDTH; i++) {
-            value += ' ';
+void appendJsonString(String &out, const String &value) {
+    out += '"';
+    for (unsigned int i = 0; i < value.length(); i++) {
+        const char c = value[i];
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                out += c;
+                break;
         }
-        return value;
-    }();
-    return line;
+    }
+    out += '"';
 }
 
-const String &blankResponseWindow() {
-    static const String window = []() {
-        String value;
-        value.reserve(kResponseWindowLines * SCREEN_WIDTH);
-        for (int i = 0; i < kResponseWindowLines; i++) {
-            value += blankResponseLine();
-        }
-        return value;
-    }();
-    return window;
+bool shouldStoreResponse(const RequestOptions &options) {
+    return !options.isVision && options.updateConversationState;
 }
 
-String padDisplayLine(String value) {
-    if (value.length() > SCREEN_WIDTH) {
-        value = value.substring(0, SCREEN_WIDTH);
-    }
-    while (value.length() < SCREEN_WIDTH) {
-        value += ' ';
-    }
-    return value;
+bool shouldUsePreviousResponse(const RequestOptions &options) {
+    return options.includePreviousResponse && previousResponseId.length() > 0;
 }
 
-void clearQueuedResponse() {
-    queuedResponse = "";
-    responseReady = false;
+String buildVisionInstructions() {
+    String instructions = CAMERA_PROMPT;
+    if (WifiManager::photoRecapEnabled()) {
+        instructions += CAMERA_RECAP_SUFFIX;
+    }
+    return instructions;
 }
 
-void resetPendingTextCommand() {
-    pendingTextCommand = PendingTextCommand::None;
+void logDnsState(const char *prefix) {
+    Serial.printf("%s dns1=%s dns2=%s\n",
+                  prefix,
+                  WiFi.dnsIP(0).toString().c_str(),
+                  WiFi.dnsIP(1).toString().c_str());
 }
 
-void resetUnlockedSessionState() {
-    resetPendingTextCommand();
-    clearQueuedResponse();
-}
-
-void swapDisplayLineArrays(String *lhs, String *rhs) {
-    for (int i = 0; i < kMaxResponseLines; i++) {
-        std::swap(lhs[i], rhs[i]);
-    }
-}
-
-void saveCurrentResponseAsPrevious() {
-    previousTopLine = currentTopLine;
-    previousTotalResponseLines = totalResponseLines;
-    for (int i = 0; i < kMaxResponseLines; i++) {
-        previousResponseLines[i] = responseLines[i];
-    }
-    previousConversationResponseId = OpenAI::conversationResponseId();
-    previousResponseAvailable = previousTotalResponseLines > 0;
-}
-
-void acceptUnlock() {
-    unlocked = true;
-    unlockArmed = true;
-    resetUnlockedSessionState();
-}
-
-void refreshUnlockWindow() {
-    unlockArmed = true;
-    resetUnlockedSessionState();
-}
-
-void queueResponse(const String &value) {
-    queuedResponse = value;
-    responseReady = true;
-}
-
-void queueError(const String &value) {
-    queueResponse("ERR:" + value);
-}
-
-void scheduleProgramSend() {
-    sendProgramFlag = true;
-    sendProgramAt = millis() + kProgramSendDelayMs;
-}
-
-bool sendProgramVariableOnce() {
-    Serial.println("Sending TIAI program to calculator...");
-
-    const uint16_t contentLen = PROGRAM_DATA_LEN;
-    const uint16_t dataLen = contentLen + 2;
-
-    uint8_t rts[13];
-    rts[0] = dataLen & 0xFF;
-    rts[1] = (dataLen >> 8) & 0xFF;
-    rts[2] = kTiVarTypeProgram;
-    memset(&rts[3], 0x00, 8);
-    memcpy(&rts[3], PROGRAM_NAME, strlen(PROGRAM_NAME));
-    rts[11] = 0x00;
-    rts[12] = 0x00;
-
-    uint8_t *payload = static_cast<uint8_t *>(malloc(dataLen));
-    if (!payload) {
-        Serial.println("malloc failed");
-        return false;
-    }
-
-    payload[0] = contentLen & 0xFF;
-    payload[1] = (contentLen >> 8) & 0xFF;
-    memcpy(&payload[2], PROGRAM_DATA, contentLen);
-
-    uint8_t txHeader[4];
-    uint8_t rxHeader[4];
-    uint8_t rxBuffer[64];
-    int rxLen = 0;
-
-    cbl.resetLines();
-
-    txHeader[0] = kTiMachineIdComputer;
-    txHeader[1] = kTiCmdRequestToSend;
-    txHeader[2] = 13;
-    txHeader[3] = 0;
-    if (cbl.send(txHeader, rts, 13)) {
-        Serial.println("RTS failed");
-        free(payload);
-        return false;
-    }
-
-    if (cbl.get(rxHeader, rxBuffer, &rxLen, 64) || rxHeader[1] != kTiCmdAcknowledge) {
-        Serial.println("No ACK after RTS");
-        free(payload);
-        return false;
-    }
-
-    if (cbl.get(rxHeader, rxBuffer, &rxLen, 64)) {
-        Serial.println("No CTS");
-        free(payload);
-        return false;
-    }
-
-    if (rxHeader[1] == kTiCmdSkip) {
-        Serial.println("Calculator rejected transfer");
-        free(payload);
-        return false;
-    }
-
-    if (rxHeader[1] == kTiCmdClearToSend) {
-        txHeader[1] = kTiCmdAcknowledge;
-        txHeader[2] = 0;
-        txHeader[3] = 0;
-        cbl.send(txHeader, nullptr, 0);
-    }
-
-    txHeader[0] = kTiMachineIdComputer;
-    txHeader[1] = kTiCmdData;
-    txHeader[2] = dataLen & 0xFF;
-    txHeader[3] = (dataLen >> 8) & 0xFF;
-    if (cbl.send(txHeader, payload, dataLen)) {
-        Serial.println("DATA failed");
-        free(payload);
-        return false;
-    }
-    free(payload);
-
-    if (cbl.get(rxHeader, rxBuffer, &rxLen, 64) || rxHeader[1] != kTiCmdAcknowledge) {
-        Serial.println("No ACK after DATA");
-        return false;
-    }
-
-    txHeader[1] = kTiCmdEndOfTransmission;
-    txHeader[2] = 0;
-    txHeader[3] = 0;
-    if (cbl.send(txHeader, nullptr, 0)) {
-        Serial.println("EOT failed");
-        return false;
-    }
-
-    if (cbl.get(rxHeader, rxBuffer, &rxLen, 64, kEotAckTimeoutUs) ||
-        rxHeader[1] != kTiCmdAcknowledge) {
-        Serial.println("No ACK after EOT (treating as success)");
+bool ensureOpenAIHostResolves() {
+    IPAddress resolved;
+    if (WiFi.hostByName(OPENAI_HOST, resolved)) {
+        Serial.printf("DNS OK: %s -> %s\n", OPENAI_HOST, resolved.toString().c_str());
         return true;
     }
 
-    Serial.println("Program sent OK!");
-    return true;
-}
-
-void sendProgramVariable() {
-    if (sendProgramVariableOnce()) {
-        return;
-    }
-
-    Serial.println("Program send failed; retrying once...");
-    delay(250);
-    cbl.resetLines();
-
-    if (!sendProgramVariableOnce()) {
-        Serial.println("Program send failed after retry");
-    }
-}
-
-void clearResponseLines() {
-    for (String &line : responseLines) {
-        line = blankResponseLine();
-    }
-    totalResponseLines = 0;
-    currentTopLine = 0;
-}
-
-void addResponseLine(const String &rawLine) {
-    if (totalResponseLines >= kMaxResponseLines) {
-        return;
-    }
-
-    responseLines[totalResponseLines++] = padDisplayLine(rawLine);
-}
-
-void wrapResponseParagraph(String paragraph) {
-    if (totalResponseLines >= kMaxResponseLines) {
-        return;
-    }
-
-    paragraph.replace('\t', ' ');
-    paragraph.trim();
-    if (paragraph.length() == 0) {
-        addResponseLine("");
-        return;
-    }
-
-    String line = "";
-    String word = "";
-
-    auto emitWord = [&](String rawWord) {
-        if (totalResponseLines >= kMaxResponseLines) {
-            return;
-        }
-
-        while (rawWord.length() > SCREEN_WIDTH) {
-            if (line.length() > 0) {
-                addResponseLine(line);
-                line = "";
-                if (totalResponseLines >= kMaxResponseLines) {
-                    return;
-                }
-            }
-            addResponseLine(rawWord.substring(0, SCREEN_WIDTH));
-            rawWord = rawWord.substring(SCREEN_WIDTH);
-            if (totalResponseLines >= kMaxResponseLines) {
-                return;
-            }
-        }
-
-        if (rawWord.length() == 0) {
-            return;
-        }
-
-        if (line.length() == 0) {
-            line = rawWord;
-        } else if (line.length() + 1 + rawWord.length() <= SCREEN_WIDTH) {
-            line += " " + rawWord;
-        } else {
-            addResponseLine(line);
-            line = rawWord;
-        }
-    };
-
-    for (unsigned int i = 0; i <= paragraph.length(); i++) {
-        char c = (i < paragraph.length()) ? paragraph[i] : ' ';
-        if (c == ' ') {
-            if (word.length() > 0) {
-                emitWord(word);
-                word = "";
-                if (totalResponseLines >= kMaxResponseLines) {
-                    break;
-                }
-            }
-        } else {
-            word += c;
-        }
-    }
-
-    if (line.length() > 0 && totalResponseLines < kMaxResponseLines) {
-        addResponseLine(line);
-    }
-}
-
-void setResponse(const String &text) {
-    clearResponseLines();
-
-    String paragraph = "";
-    for (unsigned int i = 0; i < text.length(); i++) {
-        char c = text[i];
-        if (c == '\r') {
-            continue;
-        }
-        if (c == '\n') {
-            wrapResponseParagraph(paragraph);
-            paragraph = "";
-            continue;
-        }
-        paragraph += c;
-    }
-    wrapResponseParagraph(paragraph);
-
-    if (totalResponseLines == 0) {
-        addResponseLine("");
-    }
-}
-
-int maxTopLine() {
-    return std::max(0, totalResponseLines - kResponseWindowLines);
-}
-
-String getPageWindow(int topLine) {
-    if (totalResponseLines <= 0) {
-        return blankResponseWindow();
-    }
-
-    topLine = std::max(0, std::min(topLine, maxTopLine()));
-
-    String window = "";
-    for (int i = 0; i < kResponseWindowLines; i++) {
-        const int lineIndex = topLine + i;
-        if (lineIndex >= 0 && lineIndex < totalResponseLines) {
-            window += responseLines[lineIndex];
-        } else {
-            window += blankResponseLine();
-        }
-    }
-    return window;
-}
-
-void queueCurrentWindow() {
-    queueResponse(getPageWindow(currentTopLine));
-}
-
-void restorePreviousResponse() {
-    if (!previousResponseAvailable) {
-        queueError("NO PREVIOUS");
-        return;
-    }
-
-    std::swap(currentTopLine, previousTopLine);
-    std::swap(totalResponseLines, previousTotalResponseLines);
-    swapDisplayLineArrays(responseLines, previousResponseLines);
-
-    const String currentConversationResponseId = OpenAI::conversationResponseId();
-    OpenAI::setConversationResponseId(previousConversationResponseId);
-    previousConversationResponseId = currentConversationResponseId;
-    previousResponseAvailable = previousTotalResponseLines > 0;
-
-    queueCurrentWindow();
-}
-
-void armPendingTextCommand(PendingTextCommand command) {
-    pendingTextCommand = command;
-    clearQueuedResponse();
-}
-
-void cmdConnect() {
-    if (WifiManager::isConnected()) {
-        queueResponse("CONNECTED");
-        return;
-    }
-    if (WifiManager::isConnectPending()) {
-        // Already connecting; don't queue anything so TI-BASIC poll loop
-        // keeps spinning on "READY" until pollConnect() delivers the result.
-        return;
-    }
-
-    if (!WifiManager::beginConnect()) {
-        queueError("NO WIFI CFG");
-    }
-    // No response queued -- pollConnect() in loop() will queue
-    // "CONNECTED" or "WIFI FAILED" when the handshake finishes.
-}
-
-void cmdDisconnect() {
+    logDnsState("DNS fail:");
+    Serial.println("Reconnecting WiFi to recover DNS...");
     WifiManager::disconnect();
-    queueResponse("DISCONNECTED");
+    delay(kWifiReconnectDelayMs);
+    if (!WifiManager::connect(kWifiReconnectTimeoutMs)) {
+        return false;
+    }
+
+    if (WiFi.hostByName(OPENAI_HOST, resolved)) {
+        Serial.printf("DNS OK after reconnect: %s -> %s\n",
+                      OPENAI_HOST, resolved.toString().c_str());
+        return true;
+    }
+
+    logDnsState("DNS still failing:");
+    return false;
 }
 
-void cmdConfigure() {
-    queueResponse("AP STARTING...");
-    startConfigFlag = true;
+void addTextInputMessage(JsonArray input, const char *role, const String &text) {
+    JsonObject message = input.createNestedObject();
+    message["role"] = role;
+    JsonArray content = message.createNestedArray("content");
+    JsonObject part = content.createNestedObject();
+    part["type"] = "input_text";
+    part["text"] = text;
 }
 
-void cmdSnapSolve() {
-    if (!WifiManager::isConnected()) {
-        queueError("NO WIFI");
-        return;
+String buildTextRequestBody(const RequestOptions &options) {
+    const size_t capacity =
+        1536 + options.instructions.length() + options.userMessage.length() + previousResponseId.length();
+    DynamicJsonDocument doc(capacity);
+
+    doc["model"] = OPENAI_MODEL;
+    doc["instructions"] = options.instructions;
+    doc["temperature"] = kRequestTemperature;
+    doc["max_output_tokens"] = kMaxOutputTokens;
+    doc["store"] = shouldStoreResponse(options);
+
+    if (shouldUsePreviousResponse(options)) {
+        doc["previous_response_id"] = previousResponseId;
     }
 
-    String imageBase64 = Camera::captureBase64();
-    if (imageBase64.length() == 0) {
-        queueError("CAMERA FAIL");
-        return;
-    }
+    JsonArray input = doc.createNestedArray("input");
+    addTextInputMessage(input, "user", options.userMessage);
 
-    Serial.println("Sending to OpenAI vision...");
-    setResponse(OpenAI::solveImage(imageBase64));
-    queueCurrentWindow();
+    String body;
+    body.reserve(capacity);
+    serializeJson(doc, body);
+    return body;
 }
 
-void cmdScrollDown() {
-    if (totalResponseLines <= 0) {
-        queueError("NO RESPONSE");
-        return;
-    }
+String buildVisionRequestBody(const RequestOptions &options) {
+    // This path is intentionally manual. Fully materializing the image request in
+    // ArduinoJson would duplicate a very large base64 string in RAM, which makes
+    // TLS uploads noticeably less reliable on the ESP32. The text-only path can
+    // use ArduinoJson safely because those payloads stay small.
+    const String prompt = options.userMessage.length() > 0
+        ? options.userMessage
+        : String(kDefaultVisionPrompt);
 
-    if (currentTopLine < maxTopLine()) {
-        currentTopLine++;
-    }
-    queueCurrentWindow();
+    String body;
+    // Reserve once so we do not keep reallocating while appending a 100KB+ image.
+    body.reserve(strlen(OPENAI_MODEL) + options.instructions.length() + prompt.length() +
+                 options.imageBase64.length() + 256);
+    body += "{\"model\":";
+    appendJsonString(body, OPENAI_MODEL);
+    body += ",\"instructions\":";
+    appendJsonString(body, options.instructions);
+    body += ",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":";
+    appendJsonString(body, prompt);
+    body += "},{\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,";
+    body += options.imageBase64;
+    body += "\"}]}],\"max_output_tokens\":";
+    body += String(kMaxOutputTokens);
+    body += ",\"temperature\":";
+    body += String(kRequestTemperature, 1);
+    body += ",\"store\":false}";
+    return body;
 }
 
-void cmdScrollUp() {
-    if (totalResponseLines <= 0) {
-        queueError("NO RESPONSE");
-        return;
-    }
-
-    if (currentTopLine > 0) {
-        currentTopLine--;
-    }
-    queueCurrentWindow();
+String buildRequestBody(const RequestOptions &options) {
+    return options.isVision ? buildVisionRequestBody(options)
+                            : buildTextRequestBody(options);
 }
 
-void handleTextPrompt(const String &text, bool isReply) {
-    if (!WifiManager::isConnected()) {
-        queueError("NO WIFI");
-        return;
-    }
-    if (text.length() == 0) {
-        queueError("EMPTY PROMPT");
-        return;
+String extractOutputText(const String &rawResponse) {
+    DynamicJsonDocument doc(rawResponse.length() + kResponseParseSlack);
+    const DeserializationError err = deserializeJson(doc, rawResponse);
+    if (err) {
+        return "Error: malformed response";
     }
 
-    Serial.printf("%s received (%u chars)\n",
-                  isReply ? "Reply" : "Prompt",
-                  text.length());
-    if (isReply) {
-        saveCurrentResponseAsPrevious();
+    JsonArray output = doc["output"].as<JsonArray>();
+    if (output.isNull()) {
+        return "Error: no content in response";
     }
-    setResponse(isReply ? OpenAI::reply(text) : OpenAI::ask(text));
-    queueCurrentWindow();
-}
 
-void dispatchUnlockedCommand(long value) {
-    switch (value) {
-        case kCommandConnect:
-            cmdConnect();
-            break;
-        case kCommandDisconnect:
-            cmdDisconnect();
-            break;
-        case kCommandConfigure:
-            cmdConfigure();
-            break;
-        case kCommandAskFresh:
-            armPendingTextCommand(PendingTextCommand::AskFresh);
-            break;
-        case kCommandSnapSolve:
-            cmdSnapSolve();
-            break;
-        case kCommandScrollDown:
-            cmdScrollDown();
-            break;
-        case kCommandScrollUp:
-            cmdScrollUp();
-            break;
-        case kCommandReply:
-            armPendingTextCommand(PendingTextCommand::Reply);
-            break;
-        case kCommandShowPreviousResponse:
-            restorePreviousResponse();
-            break;
-        default:
-            queueError("UNKNOWN CMD");
-            break;
-    }
-}
-
-void handleInboundCommandValue(long value, const char *sourceLabel) {
-    if (!unlocked) {
-        if (value == PASSWORD) {
-            acceptUnlock();
-        } else {
-            scheduleProgramSend();
+    String content;
+    for (JsonObject item : output) {
+        const char *itemType = item["type"] | "";
+        if (strcmp(itemType, "message") != 0) {
+            continue;
         }
-        return;
+
+        JsonArray parts = item["content"].as<JsonArray>();
+        for (JsonObject part : parts) {
+            const char *partType = part["type"] | "";
+            const char *text = part["text"] | "";
+            if ((strcmp(partType, "output_text") == 0 || strcmp(partType, "text") == 0) &&
+                text[0] != '\0') {
+                content += text;
+            }
+        }
     }
 
-    if (value == PASSWORD) {
-        refreshUnlockWindow();
-        return;
+    content.trim();
+    if (content.endsWith("END OF MESSAGE.")) {
+        content = content.substring(0, content.length() - strlen("END OF MESSAGE."));
+    } else if (content.endsWith("END OF MESSAGE")) {
+        content = content.substring(0, content.length() - strlen("END OF MESSAGE"));
+    }
+    content.trim();
+
+    return content.length() > 0 ? content : String("Error: no content in response");
+}
+
+String extractResponseId(const String &rawResponse) {
+    StaticJsonDocument<32> filter;
+    filter["id"] = true;
+
+    DynamicJsonDocument doc(kResponseIdDocCapacity);
+    const DeserializationError err =
+        deserializeJson(doc, rawResponse, DeserializationOption::Filter(filter));
+    if (err) {
+        return "";
     }
 
-    if (!unlockArmed) {
-        Serial.printf("%s command %ld without fresh unlock -> sending program\n",
-                      sourceLabel, value);
-        scheduleProgramSend();
-        return;
+    const char *id = doc["id"] | "";
+    return String(id);
+}
+
+String extractErrorMessage(const String &rawResponse) {
+    DynamicJsonDocument doc(rawResponse.length() + kErrorParseSlack);
+    const DeserializationError err = deserializeJson(doc, rawResponse);
+    if (err) {
+        return rawResponse.substring(0, 200);
     }
 
-    unlockArmed = false;
-    dispatchUnlockedCommand(value);
+    const char *errorMessage = doc["error"]["message"] | nullptr;
+    if (errorMessage && errorMessage[0] != '\0') {
+        return String(errorMessage);
+    }
+
+    const char *message = doc["message"] | nullptr;
+    if (message && message[0] != '\0') {
+        return String(message);
+    }
+
+    return rawResponse.substring(0, 200);
+}
+
+RequestResult runRequest(const String &body, const String &apiKey) {
+    RequestResult result;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(30);
+    client.setTimeout(30);
+
+    HTTPClient http;
+    const String url = "https://" + String(OPENAI_HOST) + String(OPENAI_PATH);
+    if (!http.begin(client, url)) {
+        result.rawBody = "begin failed";
+        return result;
+    }
+
+    http.setReuse(false);
+    http.setConnectTimeout(kHttpConnectTimeoutMs);
+    http.setTimeout(kHttpRequestTimeoutMs);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + apiKey);
+
+    result.httpCode = http.POST(body);
+    if (result.httpCode > 0) {
+        result.rawBody = http.getString();
+    } else {
+        result.rawBody = http.errorToString(result.httpCode);
+    }
+    http.end();
+
+    Serial.printf("API result code: %d\n", result.httpCode);
+    return result;
+}
+
+RequestResult runRequestWithRetry(const String &body, const String &apiKey) {
+    RequestResult result = runRequest(body, apiKey);
+    if (result.httpCode > 0) {
+        return result;
+    }
+
+    Serial.printf("Transport error %d. Retrying once...\n", result.httpCode);
+    delay(kTransportRetryDelayMs);
+    WifiManager::disconnect();
+    delay(kWifiReconnectDelayMs);
+    WifiManager::connect(kWifiReconnectTimeoutMs);
+    ensureOpenAIHostResolves();
+    return runRequest(body, apiKey);
 }
 
 }  // namespace
 
-int onReceived(uint8_t type, enum Endpoint model, int datalen) {
-    Serial.printf("RX: type=0x%02X len=%d\n", type, datalen);
-
-    if (type == 0x00) {
-        const long value = static_cast<long>(TIVar::realToFloat8x(data, model));
-        handleInboundCommandValue(value, "Numeric");
-        return 0;
-    }
-
-    if (type == 0x01) {
-        const int listSize = TIVar::sizeWordToInt(&data[0]);
-        if (listSize < 1) {
-            return 0;
-        }
-        const long value = static_cast<long>(TIVar::realToFloat8x(&data[2], model));
-        handleInboundCommandValue(value, "List");
-        return 0;
-    }
-
-    if (type == 0x04) {
-        const String text = TIVar::strVarToString8x(data, model);
-        if (!unlocked) {
-            scheduleProgramSend();
-            return 0;
-        }
-
-        const PendingTextCommand command = pendingTextCommand;
-        resetPendingTextCommand();
-
-        if (command == PendingTextCommand::Reply) {
-            handleTextPrompt(text, true);
-        } else {
-            handleTextPrompt(text, false);
-        }
-    }
-
-    return 0;
+void clearConversation() {
+    previousResponseId = "";
+    Serial.println("Conversation cleared");
 }
 
-int onRequest(uint8_t type, enum Endpoint model, int *headerLen, int *dataLen, data_callback *dcb) {
-    if (type != VarTypes82::VarString) {
-        Serial.printf("REQ: unsupported type=0x%02X\n", type);
-        return -1;
-    }
-
-    if (!responseReady) {
-        queueResponse("READY");
-    }
-
-    const String toSend = queuedResponse;
-    clearQueuedResponse();
-
-    const int len = TIVar::stringToStrVar8x(toSend.c_str(), data, model);
-    if (len < 0) {
-        Serial.println("REQ: failed to encode string response");
-        return -1;
-    }
-
-    memset(header, 0, sizeof(header));
-    TIVar::intToSizeWord(len, header);
-    header[2] = VarTypes82::VarString;
-    header[3] = 0xAA;
-    header[4] = 0x00;
-    *headerLen = 13;
-    *dataLen = len;
-    *dcb = nullptr;
-
-    Serial.printf("REQ: send len=%d\n", len);
-    return 0;
+String conversationResponseId() {
+    return previousResponseId;
 }
 
-void setup() {
-    Serial.begin(115200);
-    delay(3000);
-    Serial.println("\n=== TI-84 AI Firmware ===");
-    Serial.printf("PIN_TIP=%d, PIN_RING=%d\n", PIN_TIP, PIN_RING);
-    Serial.flush();
+void setConversationResponseId(const String &responseId) {
+    previousResponseId = responseId;
+}
 
-    Serial.println("Loading credentials...");
-    WifiManager::loadCredentials();
-    Camera::applyQualityProfile(WifiManager::cameraQualityProfile());
-    Serial.println("Camera init deferred until first photo/debug use.");
+String chat(const String &userMessage,
+            const String &imageBase64 = "",
+            bool includeHistory = false,
+            bool updateTextHistory = false) {
+    if (!WifiManager::isConnected()) {
+        return "Error: WiFi not connected";
+    }
 
-    cbl.setLines(PIN_TIP, PIN_RING);
-    cbl.resetLines();
-    cbl.setupCallbacks(header, data, kMaxDataLen, onReceived, onRequest);
+    const String apiKey = WifiManager::getAPIKey();
+    if (apiKey.length() == 0) {
+        return "Error: No API key configured";
+    }
 
-    if (!WifiManager::hasCredentials()) {
-        Serial.println("No credentials. Starting config portal...");
-        WifiManager::startConfigPortal();
+    RequestOptions options;
+    options.userMessage = userMessage;
+    options.imageBase64 = imageBase64;
+    options.includePreviousResponse = includeHistory;
+    options.updateConversationState = updateTextHistory;
+    options.isVision = imageBase64.length() > 0;
+    options.instructions = options.isVision ? buildVisionInstructions() : String(SYSTEM_PROMPT);
+
+    if (!ensureOpenAIHostResolves()) {
+        return "DNS ERROR";
+    }
+
+    const String body = buildRequestBody(options);
+    RequestResult result = runRequestWithRetry(body, apiKey);
+
+    String response;
+    if (result.httpCode == 200) {
+        response = extractOutputText(result.rawBody);
+
+        if (shouldStoreResponse(options)) {
+            previousResponseId = extractResponseId(result.rawBody);
+        }
+    } else if (result.httpCode > 0) {
+        response = "API error " + String(result.httpCode) + ": " +
+                   extractErrorMessage(result.rawBody);
+        Serial.println(response);
     } else {
-        Serial.println("Credentials loaded. Use calculator CONNECT to join WiFi.");
+        if (result.rawBody == "connection refused") {
+            response = "DNS/NET ERROR";
+        } else {
+            response = "HTTP error " + String(result.httpCode) + ": " + result.rawBody;
+        }
+        Serial.println(response);
     }
 
-    Serial.println("Ready. Waiting for calculator...");
+    return response;
 }
 
-void loop() {
-    cbl.eventLoopTick(true);
+String ask(const String &prompt) {
+    clearConversation();
+    return chat(prompt, "", false, true);
+}
 
-    const unsigned long now = millis();
-    if (now - lastHeartbeat >= kHeartbeatIntervalMs) {
-        lastHeartbeat = now;
-        Serial.printf("[%lus] alive, unlocked=%d wifi=%d pending=%d\n",
-                      now / 1000, unlocked, WiFi.status(), WifiManager::isConnectPending());
-    }
+String reply(const String &prompt) {
+    return chat(prompt, "", true, true);
+}
 
-    WifiManager::handleConfigPortal();
+String solveImage(const String &imageBase64) {
+    return chat("", imageBase64, false, false);
+}
 
-    if (WifiManager::isConnectPending()) {
-        WifiManager::ConnectResult result = WifiManager::pollConnect();
-        if (result == WifiManager::ConnectResult::Connected) {
-            queueResponse("CONNECTED");
-        } else if (result == WifiManager::ConnectResult::Failed) {
-            queueError("WIFI FAILED");
+namespace {
+
+// Runs ask()/reply()/solveImage() on a background task so the main loop keeps
+// servicing the calculator link port (cbl.eventLoopTick()) while the HTTP
+// request/camera capture is in flight. The task is a self-contained unit of
+// work; the only handoff back to the caller's thread is the single result
+// string below, guarded by asyncMutex.
+SemaphoreHandle_t asyncMutex = xSemaphoreCreateMutex();
+bool asyncBusy = false;
+bool asyncDone = false;
+String asyncResultText;
+
+enum class AsyncKind { Ask, Reply, SolveImage };
+
+struct AsyncTaskParams {
+    AsyncKind kind;
+    String prompt;
+};
+
+void asyncTaskEntry(void *paramPtr) {
+    AsyncTaskParams *params = static_cast<AsyncTaskParams *>(paramPtr);
+    String result;
+
+    switch (params->kind) {
+        case AsyncKind::Ask:
+            result = ask(params->prompt);
+            break;
+        case AsyncKind::Reply:
+            result = reply(params->prompt);
+            break;
+        case AsyncKind::SolveImage: {
+            const Camera::FocusCheckResult focus = Camera::checkFocusQuality();
+            if (!focus.passed) {
+                result = "IMAGE UNCLEAR. HOLD STEADY, GET CLOSER, AND RETRY.";
+            } else {
+                const String imageBase64 = Camera::captureBase64();
+                result = imageBase64.length() > 0
+                             ? solveImage(imageBase64)
+                             : String("Error: camera capture failed");
+            }
+            break;
         }
     }
 
-    if (sendProgramFlag && millis() >= sendProgramAt) {
-        sendProgramFlag = false;
-        Serial.println(">>> sendProgramFlag! Sending program...");
-        sendProgramVariable();
-    }
+    delete params;
 
-    if (startConfigFlag && !responseReady) {
-        startConfigFlag = false;
-        WifiManager::startConfigPortal();
-    }
+    Serial.printf("OpenAI task stack high water mark: %u bytes\n",
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    asyncResultText = result;
+    asyncDone = true;
+    xSemaphoreGive(asyncMutex);
+
+    vTaskDelete(nullptr);
 }
+
+void beginAsyncTask(AsyncKind kind, const String &prompt) {
+    AsyncTaskParams *params = new AsyncTaskParams();
+    params->kind = kind;
+    params->prompt = prompt;
+
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    asyncBusy = true;
+    asyncDone = false;
+    xSemaphoreGive(asyncMutex);
+
+    constexpr uint32_t kTaskStackBytes = 12288;
+    constexpr UBaseType_t kTaskPriority = 1;
+    constexpr BaseType_t kTaskCore = 0;  // Opposite the Arduino loop task (core 1).
+    TaskHandle_t handle = nullptr;
+    xTaskCreatePinnedToCore(asyncTaskEntry, "openai_task", kTaskStackBytes, params,
+                            kTaskPriority, &handle, kTaskCore);
+}
+
+}  // namespace
+
+bool isBusy() {
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    const bool busy = asyncBusy;
+    xSemaphoreGive(asyncMutex);
+    return busy;
+}
+
+bool pollResult(String *outText) {
+    bool ready = false;
+    xSemaphoreTake(asyncMutex, portMAX_DELAY);
+    if (asyncDone) {
+        *outText = asyncResultText;
+        asyncResultText = "";
+        asyncDone = false;
+        asyncBusy = false;
+        ready = true;
+    }
+    xSemaphoreGive(asyncMutex);
+    return ready;
+}
+
+void beginAsk(const String &prompt) {
+    beginAsyncTask(AsyncKind::Ask, prompt);
+}
+
+void beginReply(const String &prompt) {
+    beginAsyncTask(AsyncKind::Reply, prompt);
+}
+
+void beginSolveImage() {
+    beginAsyncTask(AsyncKind::SolveImage, "");
+}
+
+}  // namespace OpenAI

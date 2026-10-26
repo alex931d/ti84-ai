@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "esp_camera.h"
 #include "mbedtls/base64.h"
 #include "camera_pins.h"
@@ -17,6 +19,22 @@ static unsigned long lastCaptureMs = 0;
 static framesize_t configuredFrameSize = CAM_FRAMESIZE;
 static int configuredJpegQuality = CAM_JPEG_QUALITY;
 static uint8_t configuredProfile = CAM_PROFILE_DEFAULT;
+
+// Guards the camera driver and lastJpeg* state: capture now happens from a
+// background OpenAI task while the debug webserver can concurrently read
+// lastJpeg*/call capture() on the main thread. Recursive because
+// captureBase64()/capturePreviewJpeg() call capture() while already holding it.
+static SemaphoreHandle_t cameraMutex = xSemaphoreCreateRecursiveMutex();
+
+struct CameraLock {
+    CameraLock() { xSemaphoreTakeRecursive(cameraMutex, portMAX_DELAY); }
+    ~CameraLock() { xSemaphoreGiveRecursive(cameraMutex); }
+};
+
+struct FocusCheckResult {
+    bool passed = true;
+    uint32_t score = 0;
+};
 
 static uint8_t *allocBuffer(size_t len) {
     uint8_t *buffer = static_cast<uint8_t *>(ps_malloc(len));
@@ -74,6 +92,7 @@ static bool storeLastCapture(camera_fb_t *fb) {
 }
 
 bool init() {
+    CameraLock lock;
     if (initialized) return true;
 
     camera_config_t config;
@@ -146,6 +165,7 @@ bool init() {
 }
 
 bool applyQualityProfile(uint8_t profile) {
+    CameraLock lock;
     framesize_t frameSize = CAM_FRAMESIZE;
     int jpegQuality = CAM_JPEG_QUALITY;
     const uint8_t resolvedProfile = resolveQualityProfile(profile, &frameSize, &jpegQuality);
@@ -193,6 +213,7 @@ bool applyQualityProfile(uint8_t profile) {
 }
 
 camera_fb_t* capture() {
+    CameraLock lock;
     if (!initialized && !init()) return nullptr;
 
     camera_fb_t *fb = esp_camera_fb_get();
@@ -208,6 +229,7 @@ camera_fb_t* capture() {
 }
 
 String captureBase64() {
+    CameraLock lock;
     camera_fb_t *fb = capture();
     if (!fb) return "";
 
@@ -235,6 +257,7 @@ String captureBase64() {
 }
 
 bool capturePreviewJpeg(uint8_t **outBuf, size_t *outLen) {
+    CameraLock lock;
     if (!outBuf || !outLen) return false;
 
     camera_fb_t *fb = capture();
@@ -254,12 +277,75 @@ bool capturePreviewJpeg(uint8_t **outBuf, size_t *outLen) {
     return true;
 }
 
-const uint8_t *lastCaptureData() { return lastJpeg; }
-size_t lastCaptureSize() { return lastJpegLen; }
-uint16_t lastCaptureWidth() { return lastJpegWidth; }
-uint16_t lastCaptureHeight() { return lastJpegHeight; }
-unsigned long lastCaptureTime() { return lastCaptureMs; }
-bool hasLastCapture() { return lastJpeg != nullptr && lastJpegLen > 0; }
+const uint8_t *lastCaptureData() { CameraLock lock; return lastJpeg; }
+size_t lastCaptureSize() { CameraLock lock; return lastJpegLen; }
+uint16_t lastCaptureWidth() { CameraLock lock; return lastJpegWidth; }
+uint16_t lastCaptureHeight() { CameraLock lock; return lastJpegHeight; }
+unsigned long lastCaptureTime() { CameraLock lock; return lastCaptureMs; }
+bool hasLastCapture() { CameraLock lock; return lastJpeg != nullptr && lastJpegLen > 0; }
 uint8_t qualityProfile() { return configuredProfile; }
+
+// Quick grayscale sharpness check, meant to run before the real JPEG capture
+// for a vision request. Switches the sensor to a small grayscale frame,
+// scores it, then restores JPEG mode. Fails open: any problem along the way
+// restores JPEG mode and reports passed=true so this can only ever skip an
+// obviously bad shot, never block a real one.
+FocusCheckResult checkFocusQuality() {
+    CameraLock lock;
+    FocusCheckResult result;
+
+    if (!initialized && !init()) {
+        return result;
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) {
+        Serial.println("Focus check: sensor unavailable, skipping");
+        return result;
+    }
+
+    const bool modeOk = s->set_pixformat(s, PIXFORMAT_GRAYSCALE) == 0 &&
+                        s->set_framesize(s, CAM_FOCUS_CHECK_FRAMESIZE) == 0;
+
+    if (modeOk) {
+        camera_fb_t *stale = esp_camera_fb_get();
+        if (stale) esp_camera_fb_return(stale);
+
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            Serial.println("Focus check: capture failed, skipping");
+        } else {
+            constexpr int kStride = 2;
+            uint64_t sumSq = 0;
+            uint32_t samples = 0;
+            for (uint16_t y = 0; y + kStride < fb->height; y += kStride) {
+                const uint8_t *row = fb->buf + static_cast<size_t>(y) * fb->width;
+                const uint8_t *nextRow = fb->buf + static_cast<size_t>(y + kStride) * fb->width;
+                for (uint16_t x = 0; x + kStride < fb->width; x += kStride) {
+                    const int dx = static_cast<int>(row[x + kStride]) - static_cast<int>(row[x]);
+                    const int dy = static_cast<int>(nextRow[x]) - static_cast<int>(row[x]);
+                    sumSq += static_cast<uint64_t>(dx * dx + dy * dy);
+                    samples++;
+                }
+            }
+            esp_camera_fb_return(fb);
+
+            result.score = samples > 0 ? static_cast<uint32_t>(sumSq / samples) : 0;
+            result.passed = result.score >= CAM_FOCUS_SCORE_MIN;
+            Serial.printf("Focus check: score=%u threshold=%u -> %s\n",
+                          static_cast<unsigned>(result.score),
+                          static_cast<unsigned>(CAM_FOCUS_SCORE_MIN),
+                          result.passed ? "OK" : "REJECTED");
+        }
+    } else {
+        Serial.println("Focus check: mode switch failed, skipping");
+    }
+
+    s->set_pixformat(s, PIXFORMAT_JPEG);
+    s->set_framesize(s, configuredFrameSize);
+    s->set_quality(s, configuredJpegQuality);
+
+    return result;
+}
 
 }  // namespace Camera
