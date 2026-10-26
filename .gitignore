@@ -21,3 +21,7 @@ __pycache__/
 # OS cruft
 Thumbs.db
 Desktop.ini
+
+# Web UI build (regenerate with web/npm run build + tools/embed_web_ui.py)
+web/node_modules/
+web/dist/

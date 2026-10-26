@@ -234,7 +234,10 @@ void startDebugServer() {
     if (debugServerStarted) return;
 
     debugServer.on("/", HTTP_GET, []() {
-        debugServer.send(200, "text/html", WebUi::DEBUG_HTML);
+        debugServer.sendHeader("Content-Encoding", "gzip");
+        debugServer.send_P(200, "text/html",
+                           reinterpret_cast<const char *>(WebUi::debugPageGzip()),
+                           WebUi::debugPageGzipLen());
     });
 
     debugServer.on("/capture.jpg", HTTP_GET, []() {
@@ -320,6 +323,13 @@ void startConfigPortal() {
     Serial.printf("Camera debug page: http://%s:81/\n", WiFi.softAPIP().toString().c_str());
 
     configServer.on("/", HTTP_GET, []() {
+        configServer.sendHeader("Content-Encoding", "gzip");
+        configServer.send_P(200, "text/html",
+                            reinterpret_cast<const char *>(WebUi::configPageGzip()),
+                            WebUi::configPageGzipLen());
+    });
+
+    configServer.on("/api/config", HTTP_GET, []() {
         WebUi::PortalState state;
         state.savedSSID = savedSSID;
         state.savedEapIdentity = savedEapIdentity;
@@ -327,7 +337,7 @@ void startConfigPortal() {
         state.debugApEnabled = savedDebugApEnabled;
         state.cameraProfile = savedCameraProfile;
         state.photoRecapEnabled = savedPhotoRecapEnabled;
-        configServer.send(200, "text/html", WebUi::renderConfigHtml(state));
+        configServer.send(200, "application/json", WebUi::renderConfigJson(state));
     });
 
     configServer.on("/save", HTTP_POST, []() {
@@ -354,7 +364,7 @@ void startConfigPortal() {
                      debugApEnabled,
                      cameraProfile,
                      photoRecapEnabled);
-        configServer.send(200, "text/html", WebUi::SAVED_HTML);
+        configServer.send(200, "application/json", "{\"ok\":true}");
         delay(2000);
         ESP.restart();
     });
