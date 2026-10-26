@@ -28,6 +28,12 @@ constexpr size_t kErrorParseSlack = 2048;
 constexpr size_t kResponseIdDocCapacity = 128;
 constexpr char kDefaultVisionPrompt[] = "Read the image and answer.";
 
+String previousResponseId = "";
+// Hint-mode conversations are tracked separately from previousResponseId so
+// a hint session can never be accidentally continued by a normal Reply (or
+// vice versa) -- see OpenAI::hintResponseId below.
+String hintResponseId = "";
+
 struct RequestOptions {
     String userMessage;
     String imageBase64;
@@ -35,14 +41,15 @@ struct RequestOptions {
     bool isVision = false;
     bool includePreviousResponse = false;
     bool updateConversationState = false;
+    // Which of the globals above this request reads/writes conversation
+    // continuity against. Always set explicitly by chatWithInstructions().
+    String *conversationSlot = nullptr;
 };
 
 struct RequestResult {
     int httpCode = HTTPC_ERROR_CONNECTION_REFUSED;
     String rawBody = "";
 };
-
-String previousResponseId = "";
 
 void appendJsonString(String &out, const String &value) {
     out += '"';
@@ -73,11 +80,14 @@ void appendJsonString(String &out, const String &value) {
 }
 
 bool shouldStoreResponse(const RequestOptions &options) {
-    return !options.isVision && options.updateConversationState;
+    // No longer excludes vision: hint-mode photo sessions need their first
+    // (vision) turn stored so later text-only turns can continue it by id.
+    return options.updateConversationState;
 }
 
 bool shouldUsePreviousResponse(const RequestOptions &options) {
-    return options.includePreviousResponse && previousResponseId.length() > 0;
+    return options.includePreviousResponse && options.conversationSlot &&
+           options.conversationSlot->length() > 0;
 }
 
 String buildVisionInstructions() {
@@ -130,8 +140,9 @@ void addTextInputMessage(JsonArray input, const char *role, const String &text) 
 }
 
 String buildTextRequestBody(const RequestOptions &options) {
+    const size_t slotLen = options.conversationSlot ? options.conversationSlot->length() : 0;
     const size_t capacity =
-        1536 + options.instructions.length() + options.userMessage.length() + previousResponseId.length();
+        1536 + options.instructions.length() + options.userMessage.length() + slotLen;
     DynamicJsonDocument doc(capacity);
 
     doc["model"] = OPENAI_MODEL;
@@ -141,7 +152,7 @@ String buildTextRequestBody(const RequestOptions &options) {
     doc["store"] = shouldStoreResponse(options);
 
     if (shouldUsePreviousResponse(options)) {
-        doc["previous_response_id"] = previousResponseId;
+        doc["previous_response_id"] = *options.conversationSlot;
     }
 
     JsonArray input = doc.createNestedArray("input");
@@ -311,6 +322,63 @@ RequestResult runRequestWithRetry(const String &body, const String &apiKey) {
     return runRequest(body, apiKey);
 }
 
+// Shared implementation behind chat() and the hint-mode functions. Each
+// caller supplies its own system prompt and which conversation-id global to
+// read/write, so normal conversations and hint sessions never share state.
+String chatWithInstructions(const String &userMessage,
+                            const String &imageBase64,
+                            bool includeHistory,
+                            bool updateConversationState,
+                            const String &instructions,
+                            String *conversationSlot) {
+    if (!WifiManager::isConnected()) {
+        return "Error: WiFi not connected";
+    }
+
+    const String apiKey = WifiManager::getAPIKey();
+    if (apiKey.length() == 0) {
+        return "Error: No API key configured";
+    }
+
+    RequestOptions options;
+    options.userMessage = userMessage;
+    options.imageBase64 = imageBase64;
+    options.includePreviousResponse = includeHistory;
+    options.updateConversationState = updateConversationState;
+    options.isVision = imageBase64.length() > 0;
+    options.instructions = instructions;
+    options.conversationSlot = conversationSlot;
+
+    if (!ensureOpenAIHostResolves()) {
+        return "DNS ERROR";
+    }
+
+    const String body = buildRequestBody(options);
+    RequestResult result = runRequestWithRetry(body, apiKey);
+
+    String response;
+    if (result.httpCode == 200) {
+        response = extractOutputText(result.rawBody);
+
+        if (shouldStoreResponse(options) && conversationSlot) {
+            *conversationSlot = extractResponseId(result.rawBody);
+        }
+    } else if (result.httpCode > 0) {
+        response = "API error " + String(result.httpCode) + ": " +
+                   extractErrorMessage(result.rawBody);
+        Serial.println(response);
+    } else {
+        if (result.rawBody == "connection refused") {
+            response = "DNS/NET ERROR";
+        } else {
+            response = "HTTP error " + String(result.httpCode) + ": " + result.rawBody;
+        }
+        Serial.println(response);
+    }
+
+    return response;
+}
+
 }  // namespace
 
 void clearConversation() {
@@ -330,51 +398,10 @@ String chat(const String &userMessage,
             const String &imageBase64 = "",
             bool includeHistory = false,
             bool updateTextHistory = false) {
-    if (!WifiManager::isConnected()) {
-        return "Error: WiFi not connected";
-    }
-
-    const String apiKey = WifiManager::getAPIKey();
-    if (apiKey.length() == 0) {
-        return "Error: No API key configured";
-    }
-
-    RequestOptions options;
-    options.userMessage = userMessage;
-    options.imageBase64 = imageBase64;
-    options.includePreviousResponse = includeHistory;
-    options.updateConversationState = updateTextHistory;
-    options.isVision = imageBase64.length() > 0;
-    options.instructions = options.isVision ? buildVisionInstructions() : String(SYSTEM_PROMPT);
-
-    if (!ensureOpenAIHostResolves()) {
-        return "DNS ERROR";
-    }
-
-    const String body = buildRequestBody(options);
-    RequestResult result = runRequestWithRetry(body, apiKey);
-
-    String response;
-    if (result.httpCode == 200) {
-        response = extractOutputText(result.rawBody);
-
-        if (shouldStoreResponse(options)) {
-            previousResponseId = extractResponseId(result.rawBody);
-        }
-    } else if (result.httpCode > 0) {
-        response = "API error " + String(result.httpCode) + ": " +
-                   extractErrorMessage(result.rawBody);
-        Serial.println(response);
-    } else {
-        if (result.rawBody == "connection refused") {
-            response = "DNS/NET ERROR";
-        } else {
-            response = "HTTP error " + String(result.httpCode) + ": " + result.rawBody;
-        }
-        Serial.println(response);
-    }
-
-    return response;
+    const String instructions =
+        imageBase64.length() > 0 ? buildVisionInstructions() : String(SYSTEM_PROMPT);
+    return chatWithInstructions(userMessage, imageBase64, includeHistory, updateTextHistory,
+                                instructions, &previousResponseId);
 }
 
 String ask(const String &prompt) {
@@ -391,6 +418,35 @@ String solveImage(const String &imageBase64) {
 }
 
 namespace {
+String hintStepInstruction(int step) {
+    return "Give hint " + String(step) + " of " + String(HINT_COUNT) +
+           ". Do not reveal the final answer.";
+}
+}  // namespace
+
+String hintAsk(const String &problemText) {
+    hintResponseId = "";
+    const String message = hintStepInstruction(1) + "\n\n" + problemText;
+    return chatWithInstructions(message, "", false, true, HINT_TEXT_PROMPT, &hintResponseId);
+}
+
+String hintSnap(const String &imageBase64) {
+    hintResponseId = "";
+    const String message = hintStepInstruction(1) + " The problem is in this photo.";
+    return chatWithInstructions(message, imageBase64, false, true, HINT_VISION_PROMPT, &hintResponseId);
+}
+
+String hintNext(int step) {
+    return chatWithInstructions(hintStepInstruction(step), "", true, true, HINT_TEXT_PROMPT,
+                                &hintResponseId);
+}
+
+String hintAnswer() {
+    const String message = "Give the complete final answer now, with brief work.";
+    return chatWithInstructions(message, "", true, true, HINT_TEXT_PROMPT, &hintResponseId);
+}
+
+namespace {
 
 // Runs ask()/reply()/solveImage() on a background task so the main loop keeps
 // servicing the calculator link port (cbl.eventLoopTick()) while the HTTP
@@ -402,11 +458,12 @@ bool asyncBusy = false;
 bool asyncDone = false;
 String asyncResultText;
 
-enum class AsyncKind { Ask, Reply, SolveImage };
+enum class AsyncKind { Ask, Reply, SolveImage, HintAsk, HintSnap, HintNext, HintAnswer };
 
 struct AsyncTaskParams {
     AsyncKind kind;
     String prompt;
+    int hintStep = 0;  // only used by HintNext
 };
 
 void asyncTaskEntry(void *paramPtr) {
@@ -432,6 +489,27 @@ void asyncTaskEntry(void *paramPtr) {
             }
             break;
         }
+        case AsyncKind::HintAsk:
+            result = hintAsk(params->prompt);
+            break;
+        case AsyncKind::HintSnap: {
+            const Camera::FocusCheckResult focus = Camera::checkFocusQuality();
+            if (!focus.passed) {
+                result = "IMAGE UNCLEAR. HOLD STEADY, GET CLOSER, AND RETRY.";
+            } else {
+                const String imageBase64 = Camera::captureBase64();
+                result = imageBase64.length() > 0
+                             ? hintSnap(imageBase64)
+                             : String("Error: camera capture failed");
+            }
+            break;
+        }
+        case AsyncKind::HintNext:
+            result = hintNext(params->hintStep);
+            break;
+        case AsyncKind::HintAnswer:
+            result = hintAnswer();
+            break;
     }
 
     delete params;
@@ -447,10 +525,11 @@ void asyncTaskEntry(void *paramPtr) {
     vTaskDelete(nullptr);
 }
 
-void beginAsyncTask(AsyncKind kind, const String &prompt) {
+void beginAsyncTask(AsyncKind kind, const String &prompt, int hintStep = 0) {
     AsyncTaskParams *params = new AsyncTaskParams();
     params->kind = kind;
     params->prompt = prompt;
+    params->hintStep = hintStep;
 
     xSemaphoreTake(asyncMutex, portMAX_DELAY);
     asyncBusy = true;
@@ -498,6 +577,22 @@ void beginReply(const String &prompt) {
 
 void beginSolveImage() {
     beginAsyncTask(AsyncKind::SolveImage, "");
+}
+
+void beginHintAsk(const String &prompt) {
+    beginAsyncTask(AsyncKind::HintAsk, prompt);
+}
+
+void beginHintSnap() {
+    beginAsyncTask(AsyncKind::HintSnap, "");
+}
+
+void beginHintNext(int step) {
+    beginAsyncTask(AsyncKind::HintNext, "", step);
+}
+
+void beginHintAnswer() {
+    beginAsyncTask(AsyncKind::HintAnswer, "");
 }
 
 }  // namespace OpenAI

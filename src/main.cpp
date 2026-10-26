@@ -31,6 +31,7 @@ enum class PendingTextCommand : uint8_t {
     None = 0,
     AskFresh = 4,
     Reply = 8,
+    HintAskFresh = 10,
 };
 
 enum CommandId : long {
@@ -43,7 +44,13 @@ enum CommandId : long {
     kCommandScrollUp = 7,
     kCommandReply = 8,
     kCommandShowPreviousResponse = 9,
+    kCommandHintAskFresh = 10,
+    kCommandHintSnap = 11,
+    kCommandHintNext = 12,
+    kCommandHintAnswer = 13,
 };
+
+constexpr int kHintCount = HINT_COUNT;
 
 CBL2 cbl;
 uint8_t header[kHeaderBufferLen];
@@ -56,6 +63,9 @@ bool startConfigFlag = false;
 PendingTextCommand pendingTextCommand = PendingTextCommand::None;
 unsigned long lastHeartbeat = 0;
 unsigned long sendProgramAt = 0;
+
+// 0 = no active hint session; 1..kHintCount = last hint delivered.
+int hintStep = 0;
 
 int currentTopLine = 0;
 int totalResponseLines = 0;
@@ -526,6 +536,77 @@ void handleTextPrompt(const String &text, bool isReply) {
     // task finishes; onRequest() keeps returning "READY" until then.
 }
 
+void handleHintTextPrompt(const String &text) {
+    if (!WifiManager::isConnected()) {
+        queueError("NO WIFI");
+        return;
+    }
+    if (text.length() == 0) {
+        queueError("EMPTY PROMPT");
+        return;
+    }
+    if (OpenAI::isBusy()) {
+        queueError("BUSY");
+        return;
+    }
+
+    Serial.printf("Hint prompt received (%u chars)\n", text.length());
+    hintStep = 1;
+    OpenAI::beginHintAsk(text);
+    // No response queued -- loop() delivers the result once the background
+    // task finishes; onRequest() keeps returning "READY" until then.
+}
+
+void cmdHintSnap() {
+    if (!WifiManager::isConnected()) {
+        queueError("NO WIFI");
+        return;
+    }
+    if (OpenAI::isBusy()) {
+        queueError("BUSY");
+        return;
+    }
+
+    Serial.println("Starting hint photo capture + OpenAI vision...");
+    hintStep = 1;
+    OpenAI::beginHintSnap();
+}
+
+void cmdHintAnswer() {
+    if (hintStep <= 0) {
+        queueError("NO HINT SESSION");
+        return;
+    }
+    if (OpenAI::isBusy()) {
+        queueError("BUSY");
+        return;
+    }
+
+    Serial.println("Requesting final hint-mode answer...");
+    OpenAI::beginHintAnswer();
+}
+
+void cmdHintNext() {
+    if (hintStep <= 0) {
+        queueError("NO HINT SESSION");
+        return;
+    }
+    if (OpenAI::isBusy()) {
+        queueError("BUSY");
+        return;
+    }
+    if (hintStep >= kHintCount) {
+        // Calculator should send kCommandHintAnswer once it has seen
+        // kHintCount hints, but fail safe rather than go out of range.
+        cmdHintAnswer();
+        return;
+    }
+
+    hintStep++;
+    Serial.printf("Requesting hint %d of %d...\n", hintStep, kHintCount);
+    OpenAI::beginHintNext(hintStep);
+}
+
 void dispatchUnlockedCommand(long value) {
     switch (value) {
         case kCommandConnect:
@@ -554,6 +635,18 @@ void dispatchUnlockedCommand(long value) {
             break;
         case kCommandShowPreviousResponse:
             restorePreviousResponse();
+            break;
+        case kCommandHintAskFresh:
+            armPendingTextCommand(PendingTextCommand::HintAskFresh);
+            break;
+        case kCommandHintSnap:
+            cmdHintSnap();
+            break;
+        case kCommandHintNext:
+            cmdHintNext();
+            break;
+        case kCommandHintAnswer:
+            cmdHintAnswer();
             break;
         default:
             queueError("UNKNOWN CMD");
@@ -620,6 +713,8 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
 
         if (command == PendingTextCommand::Reply) {
             handleTextPrompt(text, true);
+        } else if (command == PendingTextCommand::HintAskFresh) {
+            handleHintTextPrompt(text);
         } else {
             handleTextPrompt(text, false);
         }

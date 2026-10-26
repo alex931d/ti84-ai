@@ -188,6 +188,11 @@ def generate_header(tokens, program_name="TIAI", output_path="include/program_da
 
 
 # TI-BASIC program source. Edit this and re-run the script to regenerate the header.
+#
+# Hint mode (Lbl A/D/E/F/I/L/O/X/Y) hardcodes a hint count of 3 (the "<3"/"=3"
+# checks in Lbl L and the "4->X" done-sentinel). Keep this in sync with
+# HINT_COUNT in include/config.h -- there is no shared constant between this
+# Python source and the C++ firmware.
 
 TIBASIC_SOURCE = r"""
 ClrHome
@@ -203,9 +208,9 @@ Disp "    TI-84 AI"
 Disp ""
 Disp "1:SEND MESSAGE"
 Disp "2:TAKE PHOTO"
-Disp "3:SETTINGS"
+Disp "3:HINT"
+Disp "4:SETTINGS"
 Disp "CLEAR: EXIT"
-Disp ""
 0->K
 Repeat K
 getKey->K
@@ -221,6 +226,8 @@ End
 If K=93
 Goto C
 If K=94
+Goto A
+If K=95
 Goto S
 If K=101
 Stop
@@ -545,6 +552,222 @@ Goto S
 If K=101
 Goto S
 Goto G
+Lbl A
+ClrHome
+Disp "   HINT MODE"
+Disp ""
+Disp "1:TYPE PROBLEM"
+Disp "2:SNAP PHOTO"
+Disp "CLEAR: BACK"
+0->K
+Repeat K
+getKey->K
+End
+If K=45
+Goto M
+If K=101
+Goto M
+If K=92
+Goto D
+If K=93
+Goto F
+Goto A
+Lbl D
+ClrHome
+Disp "TYPE PROBLEM"
+Disp ""
+Disp "ENTER: TYPE"
+Disp "CLEAR: BACK"
+0->K
+Repeat K
+getKey->K
+End
+If K=45
+Goto A
+If K!=105
+Goto D
+ClrHome
+Input "PROBLEM:",Str1
+ClrHome
+Disp "THINKING..."
+1->X
+"ZZWAITZZ"->Str0
+"ZZWAITZZ"->Str9
+0->Y
+0->Z
+Send({P})
+Send({10})
+Get(Str9)
+Send(Str1)
+Goto E
+Lbl E
+Get(Str0)
+If Str0="ZZWAITZZ"
+Goto E
+If Str0!="READY"
+Goto L
+Z+1->Z
+If Z<8
+Goto E
+0->Z
+Y+1->Y
+If Y<3
+Then
+"ZZWAITZZ"->Str0
+"ZZWAITZZ"->Str9
+Send({P})
+Send({10})
+Get(Str9)
+Send(Str1)
+Goto E
+End
+ClrHome
+Disp "LINK ERROR"
+Disp "TRY AGAIN"
+Disp ""
+Disp "CLEAR: BACK"
+0->K
+Repeat K
+getKey->K
+End
+Goto D
+Lbl F
+ClrHome
+Disp "AIM CAMERA AT"
+Disp "PROBLEM."
+Disp ""
+Disp "ENTER: SNAP"
+Disp "CLEAR: BACK"
+0->K
+Repeat K
+getKey->K
+End
+If K=45
+Goto A
+If K!=105
+Goto F
+ClrHome
+Disp "SOLVING..."
+1->X
+"ZZWAITZZ"->Str0
+0->Y
+0->Z
+Send({P})
+Send({11})
+Goto I
+Lbl I
+Get(Str0)
+If Str0="ZZWAITZZ"
+Goto I
+If Str0!="READY"
+Goto L
+Z+1->Z
+If Z<8
+Goto I
+0->Z
+Y+1->Y
+If Y<3
+Then
+"ZZWAITZZ"->Str0
+Send({P})
+Send({11})
+Goto I
+End
+ClrHome
+Disp "LINK ERROR"
+Disp "TRY AGAIN"
+Disp ""
+Disp "CLEAR: BACK"
+0->K
+Repeat K
+getKey->K
+End
+Goto F
+Lbl L
+ClrHome
+Str0+"                                                "->Str2
+Output(1,1,sub(Str2,1,16))
+Output(2,1,sub(Str2,17,16))
+Output(3,1,sub(Str2,33,16))
+Output(4,1,sub(Str2,49,16))
+Output(5,1,sub(Str2,65,16))
+If X<3
+Then
+Output(6,1,"ENTER:NEXT HINT ")
+Else
+If X=3
+Then
+Output(6,1,"ENTER:GET ANSWER")
+Else
+Output(6,1,"                ")
+End
+End
+Output(7,1,"UP/DN: SCROLL")
+Output(8,1,"CLR:BACK")
+0->K
+Repeat K
+getKey->K
+End
+If K=26
+34->K
+If K=34
+Then
+"ZZWAITZZ"->Str0
+Send({P})
+Send({6})
+Goto X
+End
+If K=24
+25->K
+If K=25
+Then
+"ZZWAITZZ"->Str0
+Send({P})
+Send({7})
+Goto Y
+End
+If K=45
+Goto A
+If K=101
+Goto A
+If X>3
+Goto L
+If K
+Then
+"ZZWAITZZ"->Str0
+Send({P})
+If X=3
+Then
+4->X
+Send({13})
+Else
+X+1->X
+Send({12})
+End
+Goto O
+End
+Goto L
+Lbl O
+Get(Str0)
+If Str0="ZZWAITZZ"
+Goto O
+If Str0="READY"
+Goto O
+Goto L
+Lbl X
+Get(Str0)
+If Str0="ZZWAITZZ"
+Goto X
+If Str0="READY"
+Goto X
+Goto L
+Lbl Y
+Get(Str0)
+If Str0="ZZWAITZZ"
+Goto Y
+If Str0="READY"
+Goto Y
+Goto L
 """
 
 
